@@ -5,6 +5,7 @@ package ftp
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"io"
 	"net"
@@ -17,7 +18,7 @@ import (
 // EntryType describes the different types of an Entry.
 type EntryType int
 
-// The differents types of an Entry
+// The different types of an Entry
 const (
 	EntryTypeFile EntryType = iota
 	EntryTypeFolder
@@ -31,13 +32,32 @@ type ServerConn struct {
 	DisableEPSV bool
 
 	// Timezone that the server is in
-	Location *time.Location
-
+	Location      *time.Location
+	tcpConnection net.Conn
 	conn          *textproto.Conn
 	host          string
 	timeout       time.Duration
 	features      map[string]string
 	mlstSupported bool
+	client        *Client
+	ctx           context.Context
+}
+
+type Client struct {
+	Host    string
+	Timeout time.Duration
+
+	// DialContext specifies the dial function for creating unencrypted TCP connections.
+	// If DialContext is nil (and the deprecated Dial below is also nil),
+	// then the transport dials using package net.
+	DialContext func(ctx context.Context, network, addr string) (net.Conn, error)
+
+	// Dial specifies the dial function for creating unencrypted TCP connections.
+	//
+	// Deprecated: Use DialContext instead, which allows the transport
+	// to cancel dials as soon as they are no longer needed.
+	// If both are set, DialContext takes priority.
+	Dial func(network, addr string) (net.Conn, error)
 }
 
 // Entry describes a file and is returned by List().
@@ -55,57 +75,71 @@ type Response struct {
 	closed bool
 }
 
-// Connect is an alias to Dial, for backward compatibility
-func Connect(addr string) (*ServerConn, error) {
-	return Dial(addr)
+var zeroDialer net.Dialer
+
+func (c *Client) dial(ctx context.Context, network, addr string) (net.Conn, error) {
+	if c.DialContext != nil {
+		return c.DialContext(ctx, network, addr)
+	}
+	if c.Dial != nil {
+		conn, err := c.Dial(network, addr)
+		if conn == nil && err == nil {
+			err = errors.New("net/ftp: Client.Dial hook returned (nil, nil)")
+		}
+		return conn, err
+	}
+	return zeroDialer.DialContext(ctx, network, addr)
 }
 
-// Dial is like DialTimeout with no timeout
-func Dial(addr string) (*ServerConn, error) {
-	return DialTimeout(addr, 0)
-}
-
-// DialTimeout initializes the connection to the specified ftp server address.
+// Connect initializes the connection to the specified ftp server address.
 //
 // It is generally followed by a call to Login() as most FTP commands require
 // an authenticated user.
-func DialTimeout(addr string, timeout time.Duration) (*ServerConn, error) {
-	tconn, err := net.DialTimeout("tcp", addr, timeout)
+func (c *Client) Connect() (*ServerConn, error) {
+	ctx, cancelCtx := context.WithTimeout(context.Background(), c.Timeout)
+	defer cancelCtx()
+
+	tcpConnection, err := c.dial(ctx, "tcp", c.Host)
 	if err != nil {
 		return nil, err
 	}
 
 	// Use the resolved IP address in case addr contains a domain name
 	// If we use the domain name, we might not resolve to the same IP.
-	remoteAddr := tconn.RemoteAddr().(*net.TCPAddr)
+	remoteAddr, err := net.ResolveTCPAddr("tcp", c.Host)
+	if err != nil {
+		return nil, err
+	}
+	conn := textproto.NewConn(tcpConnection)
 
-	conn := textproto.NewConn(tconn)
-
-	c := &ServerConn{
-		conn:     conn,
-		host:     remoteAddr.IP.String(),
-		timeout:  timeout,
-		features: make(map[string]string),
-		Location: time.UTC,
+	connection := &ServerConn{
+		conn:          conn,
+		host:          remoteAddr.IP.String(),
+		timeout:       c.Timeout,
+		features:      make(map[string]string),
+		Location:      time.UTC,
+		client:        c,
+		ctx:           ctx,
+		tcpConnection: tcpConnection,
 	}
 
-	_, _, err = c.conn.ReadResponse(StatusReady)
+	_, _, err = connection.conn.ReadResponse(StatusReady)
 	if err != nil {
-		c.Quit()
+		connection.Quit()
 		return nil, err
 	}
 
-	err = c.feat()
+	err = connection.feat()
 	if err != nil {
-		c.Quit()
+		connection.Quit()
 		return nil, err
 	}
 
-	if _, mlstSupported := c.features["MLST"]; mlstSupported {
-		c.mlstSupported = true
+	if _, mlstSupported := connection.features["MLST"]; mlstSupported {
+		connection.mlstSupported = true
 	}
 
-	return c, nil
+	return connection, nil
 }
 
 // Login authenticates the client with specified user and password.
@@ -202,8 +236,8 @@ func (c *ServerConn) setUTF8() error {
 	return nil
 }
 
-// epsv issues an "EPSV" command to get a port number for a data connection.
-func (c *ServerConn) epsv() (port int, err error) {
+// Epsv issues an "EPSV" command to get a port number for a data connection.
+func (c *ServerConn) Epsv() (port int, err error) {
 	_, line, err := c.cmd(StatusExtendedPassiveMode, "EPSV")
 	if err != nil {
 		return
@@ -219,8 +253,8 @@ func (c *ServerConn) epsv() (port int, err error) {
 	return
 }
 
-// pasv issues a "PASV" command to get a port number for a data connection.
-func (c *ServerConn) pasv() (host string, port int, err error) {
+// Pasv issues a "PASV" command to get a port number for a data connection.
+func (c *ServerConn) Pasv() (host string, port int, err error) {
 	_, line, err := c.cmd(StatusPassiveMode, "PASV")
 	if err != nil {
 		return
@@ -267,7 +301,7 @@ func (c *ServerConn) pasv() (host string, port int, err error) {
 // it uses the best available method to do so
 func (c *ServerConn) getDataConnPort() (string, int, error) {
 	if !c.DisableEPSV {
-		if port, err := c.epsv(); err == nil {
+		if port, err := c.Epsv(); err == nil {
 			return c.host, port, nil
 		}
 
@@ -275,7 +309,7 @@ func (c *ServerConn) getDataConnPort() (string, int, error) {
 		c.DisableEPSV = true
 	}
 
-	return c.pasv()
+	return c.Pasv()
 }
 
 // openDataConn creates a new FTP data connection.
@@ -285,17 +319,19 @@ func (c *ServerConn) openDataConn() (net.Conn, error) {
 		return nil, err
 	}
 
-	return net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(port)), c.timeout)
+	return c.client.dial(c.ctx, "tcp", net.JoinHostPort(host, strconv.Itoa(port)))
 }
 
 // cmd is a helper function to execute a command and check for the expected FTP
 // return code
 func (c *ServerConn) cmd(expected int, format string, args ...interface{}) (int, string, error) {
-	_, err := c.conn.Cmd(format, args...)
+	id, err := c.conn.Cmd(format, args...)
 	if err != nil {
 		return 0, "", err
 	}
-
+	c.conn.StartResponse(id)
+	defer c.conn.EndResponse(id)
+	c.tcpConnection.SetDeadline(time.Now().Add(c.timeout))
 	return c.conn.ReadResponse(expected)
 }
 
@@ -416,7 +452,7 @@ func (c *ServerConn) CurrentDir() (string, error) {
 	end := strings.LastIndex(msg, "\"")
 
 	if start == -1 || end == -1 {
-		return "", errors.New("Unsuported PWD response format")
+		return "", errors.New("Unsupported PWD response format")
 	}
 
 	return msg[start+1 : end], nil
